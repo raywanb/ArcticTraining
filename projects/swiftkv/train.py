@@ -34,6 +34,7 @@ from arctic_training.trainer.sft_trainer import to_device
 from projects.swiftkv.models import DeepseekV2SwiftKVConfig
 from projects.swiftkv.models import LlamaSwiftKVConfig
 from projects.swiftkv.models import Qwen2SwiftKVConfig
+from projects.swiftkv.models import Qwen3SwiftKVConfig
 from projects.swiftkv.models import register_all_swiftkv
 from projects.swiftkv.models.deepseek_v2 import register_deepseek_v2
 
@@ -85,6 +86,8 @@ class SwiftKVModelFactory(HFModelFactory):
             hf_config = LlamaSwiftKVConfig.from_dict(config_dict)
         elif model_type in ["qwen2", "qwen2_swiftkv"]:
             hf_config = Qwen2SwiftKVConfig.from_dict(config_dict)
+        elif model_type in ["qwen3", "qwen3_swiftkv"]:
+            hf_config = Qwen3SwiftKVConfig.from_dict(config_dict)
         else:
             raise ValueError(f"Unsupported model type: {model_type}")
 
