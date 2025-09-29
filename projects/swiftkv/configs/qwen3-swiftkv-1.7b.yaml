@@ -17,16 +17,16 @@ data:
   sources:
     - type: huggingface_instruct
       name_or_path: Open-Orca/OpenOrca
-      sample_count: 500000
+      sample_count: 50000
     - type: huggingface_instruct
       name_or_path: nvidia/AceMath-Instruct-Training-Data
       split: general_sft_stage2
-      sample_count: 500000
+      sample_count: 50000
       kwargs:
         verification_mode: no_checks
     - type: huggingface_instruct
       name_or_path: lmsys/lmsys-chat-1m
-      sample_count: 500000
+      sample_count: 50000
   cache_dir: ./data-fast/data-cache
   num_proc: 16
   max_length: 8192
@@ -45,3 +45,8 @@ checkpoint:
     save_every_n_epochs: 1
     output_dir: ./checkpoint/qwen3-swiftkv-1.7b
     save_end_of_training: true
+# wandb:
+#   enable: true
+#   entity: "raywan-university-of-california-berkeley"
+#   project: "arctic-training"
+#   name: "qwen3-swiftkv-1.7b-21"
