@@ -36,7 +36,7 @@ from projects.swiftkv.models import register_all_swiftkv
 from projects.swiftkv.models.deepseek_v2 import register_deepseek_v2
 
 register_all_swiftkv()
-register_deepseek_v2()  # Explicitly register because it's not in transformers
+# register_deepseek_v2()  # Explicitly register because it's not in transformers
 
 
 class SwiftKVModelConfig(ModelConfig):
