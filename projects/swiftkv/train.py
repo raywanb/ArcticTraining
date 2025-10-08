@@ -57,6 +57,12 @@ class SwiftKVModelConfig(ModelConfig):
     layers after `num_key_value_layers`.
     """
 
+    kv_sharing_map: dict = None
+    """
+    Mapping from layer index to the layer index whose KV cache should be used.
+    If provided, this overrides key_value_group_size behavior.
+    """
+
 
 class SwiftKVTrainerConfig(TrainerConfig):
     logits_loss_temp: float = 2.0
@@ -93,6 +99,8 @@ class SwiftKVModelFactory(HFModelFactory):
 
         hf_config.num_key_value_layers = self.config.num_key_value_layers
         hf_config.key_value_group_size = self.config.key_value_group_size
+        if self.config.kv_sharing_map is not None:
+            hf_config.kv_sharing_map = self.config.kv_sharing_map
 
         return hf_config
 
@@ -114,16 +122,9 @@ class SwiftKVModelFactory(HFModelFactory):
         for param in model.parameters():
             param.requires_grad = False
 
-        # Initialize the swiftkv norm to the norm of the first non-kv layer.
-        layer = model.model.layers[model.config.num_key_value_layers]
-        with GatheredParameters(
-            list(model.model.norm_swiftkv.parameters()) + list(layer.input_layernorm.parameters()), modifier_rank=0
-        ):
-            model.model.norm_swiftkv.weight.data.copy_(layer.input_layernorm.weight.data)
-        model.model.norm_swiftkv.weight.requires_grad = True
-
         # Initialize all query parameters directly from the corresponding teacher layer.
-        for layer in model.model.layers[model.config.num_key_value_layers :]:
+        # Only initialize SwiftKV query projections for layers that have them (>= num_key_value_layers)
+        for layer_idx, layer in enumerate(model.model.layers[model.config.num_key_value_layers :]):
             attn = layer.self_attn
             with GatheredParameters(attn.parameters(), modifier_rank=0):
                 for q_module in q_modules:
@@ -133,25 +134,9 @@ class SwiftKVModelFactory(HFModelFactory):
                         student_param.data.copy_(teacher_param.data)
                         student_param.requires_grad = True
 
-        # Initialize all kv parameters to the mean of the teacher layers in each kv group.
-        for idx, layer in enumerate(model.model.layers[model.config.num_key_value_layers :]):
-            attn = layer.self_attn
-            if idx % model.config.key_value_group_size == 0:
-                # This layer has swiftkv parameters, zero them out.
-                kv_attn = attn
-                with GatheredParameters(kv_attn.parameters(), modifier_rank=0):
-                    # Zero out the swiftkv parameters
-                    for kv_module in kv_modules:
-                        for param in getattr(kv_attn, f"{kv_module}_swiftkv").parameters():
-                            param.data.zero_()
-                            param.requires_grad = True
-            with GatheredParameters(attn.parameters(), modifier_rank=0):
-                # Accumulate the teacher parameters into the swiftkv parameters.
-                for kv_module in kv_modules:
-                    teacher_params = getattr(attn, kv_module).parameters()
-                    student_params = getattr(kv_attn, f"{kv_module}_swiftkv").parameters()
-                    for teacher_param, student_param in zip(teacher_params, student_params):
-                        student_param.data.add_(teacher_param.data / model.config.key_value_group_size)
+        # Note: With kv_sharing_map, we don't need to initialize key/value SwiftKV parameters
+        # because layers use shared key/value states from other layers instead of their own.
+        # The key/value sharing is handled dynamically during forward pass based on kv_sharing_map.
 
         model.gradient_checkpointing_enable()
         return model

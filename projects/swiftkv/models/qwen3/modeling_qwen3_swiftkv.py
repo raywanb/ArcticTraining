@@ -59,18 +59,6 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
                 bias=config.attention_bias,
             )
             self.q_norm_swiftkv = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            if swiftkv_layer_idx % config.key_value_group_size == 0:
-                self.k_proj_swiftkv = nn.Linear(
-                    config.hidden_size,
-                    config.num_key_value_heads * self.head_dim,
-                    bias=config.attention_bias,
-                )
-                self.k_norm_swiftkv = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.v_proj_swiftkv = nn.Linear(
-                    config.hidden_size,
-                    config.num_key_value_heads * self.head_dim,
-                    bias=config.attention_bias,
-                )
     
     def forward(
         self,
@@ -87,6 +75,7 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        # Use SwiftKV projections if this is a SwiftKV layer and we have shared key/value states
         if swiftkv_key_states is not None or swiftkv_value_states is not None:
             assert swiftkv_key_states is not None and swiftkv_value_states is not None
             query_states = self.q_norm_swiftkv(
@@ -289,52 +278,46 @@ class Qwen3SwiftKVModel(Qwen3Model):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
-        swiftkv_key_states = {}
-        swiftkv_value_states = {}
-        num_key_value_layers = self.config.num_key_value_layers or self.config.num_hidden_layers
+        # Store computed key/value states for sharing
+        computed_key_states = {}
+        computed_value_states = {}
+        
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
+            # Check if this layer should use shared key/value states
+            swiftkv_key_states = None
+            swiftkv_value_states = None
+            
+            if self.config.swiftkv and layer_idx in self.config.kv_sharing_map:
+                # This layer should use key/value states from another layer
+                source_layer_idx = self.config.kv_sharing_map[layer_idx]
+                if source_layer_idx in computed_key_states and source_layer_idx in computed_value_states:
+                    swiftkv_key_states = computed_key_states[source_layer_idx]
+                    swiftkv_value_states = computed_value_states[source_layer_idx]
+
+            # Compute key/value states for this layer (needed for both sharing and normal operation)
             input_shape = hidden_states.shape[:-1]
             hidden_shape = (*input_shape, -1, decoder_layer.self_attn.head_dim)
+            
+            # Apply input layer norm to get the normalized hidden states for key/value computation
+            normed_hidden = decoder_layer.input_layernorm(hidden_states)
+            
+            # Compute key/value states
+            current_key_states = decoder_layer.self_attn.k_norm(
+                decoder_layer.self_attn.k_proj(normed_hidden).view(hidden_shape)
+            )
+            current_value_states = decoder_layer.self_attn.v_proj(normed_hidden)
+            
+            # Store for potential future sharing
+            computed_key_states[layer_idx] = current_key_states
+            computed_value_states[layer_idx] = current_value_states
 
-            if self.config.swiftkv and layer_idx == num_key_value_layers:
-                swiftkv_hidden_states = self.norm_swiftkv(hidden_states)
-                if self.gradient_checkpointing and self.training:
-                    swiftkv_hidden_states.requires_grad_(True)
-                for i, layer in enumerate(self.layers[num_key_value_layers:]):
-                    swiftkv_key_states[layer_idx + i] = (
-                        layer.self_attn.k_norm_swiftkv(
-                            layer.self_attn.k_proj_swiftkv(swiftkv_hidden_states).view(hidden_shape))
-                        if i % self.config.key_value_group_size == 0
-                        else swiftkv_key_states[layer_idx + i - 1]
-                    )
-                    swiftkv_value_states[layer_idx + i] = (
-                        layer.self_attn.v_proj_swiftkv(swiftkv_hidden_states)
-                        if i % self.config.key_value_group_size == 0
-                        else swiftkv_value_states[layer_idx + i - 1]
-                    )
-
-            # if self.gradient_checkpointing and self.training and layer_idx >= num_key_value_layers:
-            #     layer_outputs = self._gradient_checkpointing_func(
-            #         decoder_layer.__call__,
-            #         hidden_states,
-            #         swiftkv_key_states.get(layer_idx, None),
-            #         swiftkv_value_states.get(layer_idx, None),
-            #         causal_mask,
-            #         position_ids,
-            #         past_key_values,
-            #         output_attentions,
-            #         use_cache,
-            #         cache_position,
-            #         position_embeddings,
-            #     )
-            # else:
             layer_outputs = decoder_layer(
                 hidden_states,
-                swiftkv_key_states.get(layer_idx, None),
-                swiftkv_value_states.get(layer_idx, None),
+                swiftkv_key_states=swiftkv_key_states,
+                swiftkv_value_states=swiftkv_value_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
