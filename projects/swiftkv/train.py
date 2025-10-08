@@ -103,6 +103,9 @@ class SwiftKVModelFactory(HFModelFactory):
             else:
                 q_modules = ["q_a_proj", "q_b_proj", "q_a_layernorm"]
             kv_modules = ["kv_a_proj_with_mqa", "kv_b_proj", "kv_a_layernorm"]
+        elif model.config.model_type in ["qwen3", "qwen3_swiftkv"]:
+            q_modules = ["q_proj", "q_norm"]
+            kv_modules = ["k_proj", "k_norm", "v_proj"]
         else:
             q_modules = ["q_proj"]
             kv_modules = ["k_proj", "v_proj"]
