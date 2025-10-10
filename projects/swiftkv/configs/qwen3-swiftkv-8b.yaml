@@ -6,10 +6,10 @@ gradient_accumulation_steps: 1
 logits_loss_temp: 2.0
 hidden_loss_layer: -2
 model:
-  name_or_path: Qwen/Qwen3-1.7B
-  num_key_value_layers: 27
+  name_or_path: Qwen/Qwen3-8B
+  num_key_value_layers: 30
   key_value_group_size: 1
-  kv_sharing_map: {27: 26}
+  kv_sharing_map: {30: 29, 31: 29, 32: 29, 33: 29, 34: 29, 35: 29}
   attn_implementation: flash_attention_2
 deepspeed:
   zero_optimization:
@@ -18,16 +18,16 @@ data:
   sources:
     - type: huggingface_instruct
       name_or_path: Open-Orca/OpenOrca
-      sample_count: 50000
+      sample_count: 500000
     - type: huggingface_instruct
       name_or_path: nvidia/AceMath-Instruct-Training-Data
       split: general_sft_stage2
-      sample_count: 50000
+      sample_count: 500000
       kwargs:
         verification_mode: no_checks
     - type: huggingface_instruct
       name_or_path: lmsys/lmsys-chat-1m
-      sample_count: 50000
+      sample_count: 500000
   cache_dir: ./data-fast/data-cache
   num_proc: 16
   max_length: 8192
@@ -44,5 +44,10 @@ optimizer:
 checkpoint:
   - type: huggingface
     save_every_n_epochs: 1
-    output_dir: ./checkpoint/qwen3-swiftkv-1.7b
+    output_dir: ./checkpoint/qwen3-swiftkv-8b-6-consumers
     save_end_of_training: true
+wandb:
+  enable: true
+  entity: "raywan-university-of-california-berkeley"
+  project: "arctic-training"
+  name: "Qwen3 8B 30 KV Layers Full Dataset"

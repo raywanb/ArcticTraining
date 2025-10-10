@@ -56,6 +56,12 @@ class SwiftKVModelConfig(ModelConfig):
     Number of consecutive layers that share the same KV cache, only applies to
     layers after `num_key_value_layers`.
     """
+    
+    kv_sharing_map: dict = {}
+    """
+    Mapping from consumer layer index to producer layer index for KV sharing.
+    If layer i maps to layer j, then layer i will use the KV cache from layer j.
+    """
 
 
 class SwiftKVTrainerConfig(TrainerConfig):
@@ -93,6 +99,9 @@ class SwiftKVModelFactory(HFModelFactory):
 
         hf_config.num_key_value_layers = self.config.num_key_value_layers
         hf_config.key_value_group_size = self.config.key_value_group_size
+        
+        if hasattr(self.config, 'kv_sharing_map'):
+            hf_config.kv_sharing_map = self.config.kv_sharing_map
 
         return hf_config
 
@@ -105,7 +114,8 @@ class SwiftKVModelFactory(HFModelFactory):
             kv_modules = ["kv_a_proj_with_mqa", "kv_b_proj", "kv_a_layernorm"]
         elif model.config.model_type in ["qwen3", "qwen3_swiftkv"]:
             q_modules = ["q_proj", "q_norm"]
-            kv_modules = ["k_proj", "k_norm", "v_proj"]
+            # kv_modules = ["k_proj", "k_norm", "v_proj"]
+            kv_modules = []
         else:
             q_modules = ["q_proj"]
             kv_modules = ["k_proj", "v_proj"]
@@ -113,14 +123,14 @@ class SwiftKVModelFactory(HFModelFactory):
         # Freeze all teacher parameters
         for param in model.parameters():
             param.requires_grad = False
-
-        # Initialize the swiftkv norm to the norm of the first non-kv layer.
-        layer = model.model.layers[model.config.num_key_value_layers]
-        with GatheredParameters(
-            list(model.model.norm_swiftkv.parameters()) + list(layer.input_layernorm.parameters()), modifier_rank=0
-        ):
-            model.model.norm_swiftkv.weight.data.copy_(layer.input_layernorm.weight.data)
-        model.model.norm_swiftkv.weight.requires_grad = True
+    
+        if hasattr(model.model, "norm_swiftkv"):
+            # Initialize the swiftkv norm from the original model's norm.
+            with GatheredParameters(
+                list(model.model.norm_swiftkv.parameters()) + list(model.model.norm.parameters()), modifier_rank=0
+            ):
+                model.model.norm_swiftkv.weight.data.copy_(model.model.norm.weight.data)
+            model.model.norm_swiftkv.weight.requires_grad = False
 
         # Initialize all query parameters directly from the corresponding teacher layer.
         for layer in model.model.layers[model.config.num_key_value_layers :]:
@@ -153,7 +163,22 @@ class SwiftKVModelFactory(HFModelFactory):
                     for teacher_param, student_param in zip(teacher_params, student_params):
                         student_param.data.add_(teacher_param.data / model.config.key_value_group_size)
 
-        model.gradient_checkpointing_enable()
+        # print("\n=== TRAINABLE PARAMETERS ===")
+        # trainable_params = []
+        # for name, param in model.named_parameters():
+        #     if param.requires_grad:
+        #         trainable_params.append((name, param.shape, param.numel()))
+        
+        # for name, shape, numel in trainable_params[:30]:  # Print first 30
+        #     print(f"  {name}: {shape} ({numel} params)")
+        
+        # print(f"\nTotal trainable parameters: {len(trainable_params)}")
+        # print(f"Total trainable elements: {sum(n for _, _, n in trainable_params)}")
+        
+        # if len(trainable_params) == 0:
+        #     raise RuntimeError("ERROR: No trainable parameters found!")
+        
+        # model.gradient_checkpointing_enable()
         return model
 
 
@@ -165,18 +190,27 @@ class SwiftKVTrainer(SFTTrainer):
 
     def forward(self, batch):
         batch = to_device(batch, self.device)
-
+        
+        # Check trainable parameters
+        # trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        # print(f"Total trainable parameters: {trainable_count}")
+        
         with torch.no_grad():
             self.model.swiftkv(False)
+            # print(f"Teacher mode - config.swiftkv: {self.model.swiftkv}")
             self.model.eval()
-            # Call the inner model directly to avoid materializing the logits
             teacher_outputs = self.model.model(**batch, output_hidden_states=True)
-
+        
         self.model.swiftkv(True)
+        # print(f"Student mode - config.swiftkv: {self.model.swiftkv}")
         self.model.train()
-        # Call the inner model directly to avoid materializing the logits
         student_outputs = self.model.model(**batch, output_hidden_states=True)
-
+        
+        # # CRITICAL: Check if student outputs require grad
+        # print(f"Student hidden[-1] requires_grad: {student_outputs.hidden_states[-1].requires_grad}")
+        # print(f"Student hidden[-1] grad_fn: {student_outputs.hidden_states[-1].grad_fn}")
+        # print(f"Teacher hidden[-1] requires_grad: {teacher_outputs.hidden_states[-1].requires_grad}")
+        
         return student_outputs, teacher_outputs
 
     def compute_logits_loss(self, student_hidden, teacher_hidden, mask):

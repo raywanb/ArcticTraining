@@ -1,6 +1,3 @@
-
-
-
 # Copyright 2025 Snowflake Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -51,7 +48,10 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
     def __init__(self, config: Qwen3SwiftKVConfig, layer_idx: int):
         super().__init__(config, layer_idx=layer_idx)
 
-        swiftkv_layer_idx = layer_idx - config.num_key_value_layers
+        self.layer_idx = layer_idx
+        self.kv_sharing_target_layer_idx = config.kv_sharing_map.get(layer_idx, None)
+        print("layer_idx", layer_idx)
+        print("kv_sharing_target_layer_idx", self.kv_sharing_target_layer_idx)
         if layer_idx >= config.num_key_value_layers:
             self.q_proj_swiftkv = nn.Linear(
                 config.hidden_size,
@@ -59,26 +59,23 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
                 bias=config.attention_bias,
             )
             self.q_norm_swiftkv = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-            if swiftkv_layer_idx % config.key_value_group_size == 0:
-                self.k_proj_swiftkv = nn.Linear(
-                    config.hidden_size,
-                    config.num_key_value_heads * self.head_dim,
-                    bias=config.attention_bias,
-                )
-                self.k_norm_swiftkv = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-                self.v_proj_swiftkv = nn.Linear(
-                    config.hidden_size,
-                    config.num_key_value_heads * self.head_dim,
-                    bias=config.attention_bias,
-                )
+            # self.k_proj_swiftkv = nn.Linear(
+            #     config.hidden_size,
+            #     config.num_key_value_heads * self.head_dim,
+            #     bias=config.attention_bias,
+            # )
+            # self.k_norm_swiftkv = Qwen3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+            # self.v_proj_swiftkv = nn.Linear(
+            #     config.hidden_size,
+            #     config.num_key_value_heads * self.head_dim,
+            #     bias=config.attention_bias,
+            # )
     
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        swiftkv_key_states: Optional[torch.Tensor] = None,
-        swiftkv_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
@@ -87,29 +84,51 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        if swiftkv_key_states is not None or swiftkv_value_states is not None:
-            assert swiftkv_key_states is not None and swiftkv_value_states is not None
+        # Compute queries (always layer-specific)
+        if self.config.swiftkv and self.layer_idx >= self.config.num_key_value_layers:
             query_states = self.q_norm_swiftkv(
                 self.q_proj_swiftkv(hidden_states).view(hidden_shape))
-            key_states = swiftkv_key_states
-            value_states = swiftkv_value_states
         else:
             query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
+
+        # print("SHARE KV", self.config.swiftkv, self.kv_sharing_target_layer_idx, past_key_value)
+        shares_kv = (self.config.swiftkv and 
+                     self.kv_sharing_target_layer_idx is not None and 
+                     past_key_value is not None)
+
+        if shares_kv:
+            target_idx = self.kv_sharing_target_layer_idx
+            
+            key_states = past_key_value.layers[target_idx].keys
+            value_states = past_key_value.layers[target_idx].values
+    
+        else:
+            # # Compute new KV for this layer
+            # if self.config.swiftkv and self.layer_idx >= self.config.num_key_value_layers:
+            #     key_states = self.k_norm_swiftkv(
+            #         self.k_proj_swiftkv(hidden_states).view(hidden_shape))
+            #     value_states = self.v_proj_swiftkv(hidden_states).view(hidden_shape)
+            # else:
             key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
-            value_states = self.v_proj(hidden_states)
+            value_states = self.v_proj(hidden_states).view(hidden_shape)
 
-        query_states = query_states.view(hidden_shape).transpose(1, 2)
-        key_states = key_states.view(hidden_shape).transpose(1, 2)
-        value_states = value_states.view(hidden_shape).transpose(1, 2)
+        # Reshape for attention
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2) if not shares_kv else key_states
+        value_states = value_states.transpose(1, 2) if not shares_kv else value_states
 
+        # Apply rotary embeddings
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        # Update cache only for layers that compute their own KV
+        if past_key_value is not None and not shares_kv:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
+        # Attention computation
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
@@ -128,7 +147,7 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
             attention_mask,
             dropout=0.0 if not self.training else self.attention_dropout,
             scaling=self.scaling,
-            sliding_window=self.sliding_window,  # diff with Llama
+            sliding_window=self.sliding_window,
             **kwargs,
         )
         
@@ -147,7 +166,7 @@ class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if (
             config.sliding_window and config._attn_implementation != "flash_attention_2"
-        ):  # diff with Llama is this warning
+        ):
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
                 "unexpected results may be encountered."
@@ -156,15 +175,13 @@ class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        swiftkv_key_states: Optional[torch.Tensor] = None,
-        swiftkv_value_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
@@ -175,8 +192,6 @@ class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            swiftkv_key_states=swiftkv_key_states,
-            swiftkv_value_states=swiftkv_value_states,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -217,7 +232,6 @@ class Qwen3SwiftKVModel(Qwen3Model):
             [Qwen3SwiftKVDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_swiftkv = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = Qwen3RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -251,7 +265,6 @@ class Qwen3SwiftKVModel(Qwen3Model):
             )
             use_cache = False
 
-        # TODO (joao): remove this exception in v4.56 -- it exists for users that try to pass a legacy cache
         if not isinstance(past_key_values, (type(None), Cache)):
             raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
 
@@ -288,53 +301,19 @@ class Qwen3SwiftKVModel(Qwen3Model):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-
-        swiftkv_key_states = {}
-        swiftkv_value_states = {}
-        num_key_value_layers = self.config.num_key_value_layers or self.config.num_hidden_layers
+        
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
+            
+            # if self.gradient_checkpointing and self.training and layer_idx >= self.config.num_key_value_layers:
+            #     hidden_states.requires_grad_(True)
 
-            input_shape = hidden_states.shape[:-1]
-            hidden_shape = (*input_shape, -1, decoder_layer.self_attn.head_dim)
-
-            if self.config.swiftkv and layer_idx == num_key_value_layers:
-                swiftkv_hidden_states = self.norm_swiftkv(hidden_states)
-                if self.gradient_checkpointing and self.training:
-                    swiftkv_hidden_states.requires_grad_(True)
-                for i, layer in enumerate(self.layers[num_key_value_layers:]):
-                    swiftkv_key_states[layer_idx + i] = (
-                        layer.self_attn.k_norm_swiftkv(
-                            layer.self_attn.k_proj_swiftkv(swiftkv_hidden_states).view(hidden_shape))
-                        if i % self.config.key_value_group_size == 0
-                        else swiftkv_key_states[layer_idx + i - 1]
-                    )
-                    swiftkv_value_states[layer_idx + i] = (
-                        layer.self_attn.v_proj_swiftkv(swiftkv_hidden_states)
-                        if i % self.config.key_value_group_size == 0
-                        else swiftkv_value_states[layer_idx + i - 1]
-                    )
-
-            # if self.gradient_checkpointing and self.training and layer_idx >= num_key_value_layers:
-            #     layer_outputs = self._gradient_checkpointing_func(
-            #         decoder_layer.__call__,
-            #         hidden_states,
-            #         swiftkv_key_states.get(layer_idx, None),
-            #         swiftkv_value_states.get(layer_idx, None),
-            #         causal_mask,
-            #         position_ids,
-            #         past_key_values,
-            #         output_attentions,
-            #         use_cache,
-            #         cache_position,
-            #         position_embeddings,
-            #     )
-            # else:
+            if self.training and getattr(decoder_layer, "gradient_checkpointing", False):
+                hidden_states.requires_grad_(True)  # make the checkpointed input valid
+           
             layer_outputs = decoder_layer(
                 hidden_states,
-                swiftkv_key_states.get(layer_idx, None),
-                swiftkv_value_states.get(layer_idx, None),
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_value=past_key_values,
