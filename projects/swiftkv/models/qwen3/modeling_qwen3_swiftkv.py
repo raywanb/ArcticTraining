@@ -52,7 +52,9 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
         self.kv_sharing_target_layer_idx = config.kv_sharing_map.get(layer_idx, None)
         print("layer_idx", layer_idx)
         print("kv_sharing_target_layer_idx", self.kv_sharing_target_layer_idx)
-        if layer_idx >= config.num_key_value_layers:
+        # Create SwiftKV projections for layers that consume KV from other layers
+        # Only create these parameters if we have a kv_sharing_map (i.e., SwiftKV mode)
+        if layer_idx in config.kv_sharing_map:
             self.q_proj_swiftkv = nn.Linear(
                 config.hidden_size,
                 config.num_attention_heads * self.head_dim,
@@ -85,7 +87,8 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         # Compute queries (always layer-specific)
-        if self.config.swiftkv and self.layer_idx >= self.config.num_key_value_layers:
+        # Use SwiftKV params only if swiftkv mode is active and this layer has SwiftKV params
+        if self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
             query_states = self.q_norm_swiftkv(
                 self.q_proj_swiftkv(hidden_states).view(hidden_shape))
         else:

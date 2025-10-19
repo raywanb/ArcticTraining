@@ -49,6 +49,7 @@ KNOWN_HF_INSTRUCT_DATASETS: Dict[str, Dict[str, Any]] = {
     "lmsys/lmsys-chat-1m": dict(
         role_mapping=dict(user="conversation.role.user", assistant="conversation.role.assistant")
     ),
+    "TinyGSM/TinyGSM": dict(role_mapping=dict(user="question", assistant="code")),
 }
 
 

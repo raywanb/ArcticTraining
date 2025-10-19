@@ -47,20 +47,15 @@ if version.parse(transformers.__version__) < version.parse("4.54.0"):
 class SwiftKVModelConfig(ModelConfig):
     num_key_value_layers: int
     """
-    Initial number of layers that compute KV cache. The output from layer
-    `num_key_value_layers` is used to compute the KV for all subsequent layers.
-    """
-
-    key_value_group_size: int = 1
-    """
-    Number of consecutive layers that share the same KV cache, only applies to
-    layers after `num_key_value_layers`.
+    Informational parameter indicating the number of layers that produce KV cache.
+    If not set and kv_sharing_map is provided, it will be computed automatically.
     """
     
     kv_sharing_map: dict = {}
     """
-    Mapping from consumer layer index to producer layer index for KV sharing.
-    If layer i maps to layer j, then layer i will use the KV cache from layer j.
+    Primary mechanism for defining KV cache sharing. Maps consumer layer index to
+    producer layer index. If layer i maps to layer j, then layer i will use the
+    KV cache from layer j. This allows flexible sharing patterns.
     """
 
 
@@ -98,7 +93,6 @@ class SwiftKVModelFactory(HFModelFactory):
             raise ValueError(f"Unsupported model type: {model_type}")
 
         hf_config.num_key_value_layers = self.config.num_key_value_layers
-        hf_config.key_value_group_size = self.config.key_value_group_size
         
         if hasattr(self.config, 'kv_sharing_map'):
             hf_config.kv_sharing_map = self.config.kv_sharing_map
@@ -132,8 +126,12 @@ class SwiftKVModelFactory(HFModelFactory):
                 model.model.norm_swiftkv.weight.data.copy_(model.model.norm.weight.data)
             model.model.norm_swiftkv.weight.requires_grad = False
 
-        # Initialize all query parameters directly from the corresponding teacher layer.
-        for layer in model.model.layers[model.config.num_key_value_layers :]:
+        
+        # Initialize all query parameters directly from the corresponding teacher layer
+        # for layers that are consumers in the kv_sharing_map
+        consumer_layers = set(model.config.kv_sharing_map.keys())
+        for layer_idx in consumer_layers:
+            layer = model.model.layers[layer_idx]
             attn = layer.self_attn
             with GatheredParameters(attn.parameters(), modifier_rank=0):
                 for q_module in q_modules:
@@ -144,24 +142,24 @@ class SwiftKVModelFactory(HFModelFactory):
                         student_param.requires_grad = True
 
         # Initialize all kv parameters to the mean of the teacher layers in each kv group.
-        for idx, layer in enumerate(model.model.layers[model.config.num_key_value_layers :]):
-            attn = layer.self_attn
-            if idx % model.config.key_value_group_size == 0:
-                # This layer has swiftkv parameters, zero them out.
-                kv_attn = attn
-                with GatheredParameters(kv_attn.parameters(), modifier_rank=0):
-                    # Zero out the swiftkv parameters
-                    for kv_module in kv_modules:
-                        for param in getattr(kv_attn, f"{kv_module}_swiftkv").parameters():
-                            param.data.zero_()
-                            param.requires_grad = True
-            with GatheredParameters(attn.parameters(), modifier_rank=0):
-                # Accumulate the teacher parameters into the swiftkv parameters.
-                for kv_module in kv_modules:
-                    teacher_params = getattr(attn, kv_module).parameters()
-                    student_params = getattr(kv_attn, f"{kv_module}_swiftkv").parameters()
-                    for teacher_param, student_param in zip(teacher_params, student_params):
-                        student_param.data.add_(teacher_param.data / model.config.key_value_group_size)
+        # for idx, layer in enumerate(model.model.layers[model.config.num_key_value_layers :]):
+        #     attn = layer.self_attn
+        #     if idx % model.config.key_value_group_size == 0:
+        #         # This layer has swiftkv parameters, zero them out.
+        #         kv_attn = attn
+        #         with GatheredParameters(kv_attn.parameters(), modifier_rank=0):
+        #             # Zero out the swiftkv parameters
+        #             for kv_module in kv_modules:
+        #                 for param in getattr(kv_attn, f"{kv_module}_swiftkv").parameters():
+        #                     param.data.zero_()
+        #                     param.requires_grad = True
+        #     with GatheredParameters(attn.parameters(), modifier_rank=0):
+        #         # Accumulate the teacher parameters into the swiftkv parameters.
+        #         for kv_module in kv_modules:
+        #             teacher_params = getattr(attn, kv_module).parameters()
+        #             student_params = getattr(kv_attn, f"{kv_module}_swiftkv").parameters()
+        #             for teacher_param, student_param in zip(teacher_params, student_params):
+        #                 student_param.data.add_(teacher_param.data / model.config.key_value_group_size)
 
         # print("\n=== TRAINABLE PARAMETERS ===")
         # trainable_params = []
