@@ -46,8 +46,8 @@ checkpoint:
     save_every_n_epochs: 1
     output_dir: ./checkpoint/qwen3-swiftkv-8b-baseline
     save_end_of_training: true
-wandb:
-  enable: true
-  entity: "raywan-university-of-california-berkeley"
-  project: "arctic-training"
-  name: "Qwen3 8B baseline"
+# wandb:
+#   enable: true
+#   entity: "raywan-university-of-california-berkeley"
+#   project: "arctic-training"
+#   name: "Qwen3 8B baseline"

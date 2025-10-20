@@ -181,33 +181,16 @@ class SwiftKVTrainer(SFTTrainer):
     model_factory: SwiftKVModelFactory
     checkpoint_engine: Union[DSCheckpointEngine, HFCheckpointEngine]
 
-    def forward(self, batch):
-        batch = to_device(batch, self.device)
-        
+    def loss(self, batch) -> torch.Tensor:
         # Set SwiftKV mode based on whether we have a kv_sharing_map
         # If kv_sharing_map exists: use SwiftKV parameters (swiftkv=True)
         # If kv_sharing_map is empty: use all original parameters (swiftkv=False)
-        # use_swiftkv = len(self.model.config) > 0
         use_swiftkv = len(self.config.model.kv_sharing_map) > 0
         self.model.swiftkv(use_swiftkv)
-        self.model.train()
-        outputs = self.model(**batch)
         
-        return outputs
-
-    def loss(self, batch) -> torch.Tensor:
-        batch = to_device(batch, self.device)
-        assert "labels" in batch, "Batch must include labels for LM loss"
-
-
-        outputs = self.forward(batch)
-
-
-        loss = outputs.loss
-
-        # Apply sequence parallel reduction if needed
-        use_sequence_parallel = self.config.sequence_parallel_size > 1
-        if use_sequence_parallel:
-            loss = torch.distributed.nn.functional.all_reduce(loss, op=ReduceOp.AVG, group=self.sp_group)
-
-        return loss
+        # Call parent's loss method which handles all the complexity:
+        # - Proper use_cache=False
+        # - Sequence parallel with proper token weighting
+        # - Liger kernel support
+        # - Tiled logits computation
+        return super().loss(batch)
