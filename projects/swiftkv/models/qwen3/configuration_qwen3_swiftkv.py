@@ -19,6 +19,14 @@ class Qwen3SwiftKVConfig(Qwen3Config):
             producer layer index. If layer i maps to layer j, then layer i will use the
             KV cache from layer j. This allows flexible sharing patterns (e.g., layer 3
             shares from layer 2, but layer 4 produces its own KV cache).
+        mlp_tuning_enabled (bool, optional):
+            Whether to enable separate trainable MLP projections for layers that share KV cache.
+            When enabled, consumer layers will have separate gate_proj_swiftkv, up_proj_swiftkv,
+            and down_proj_swiftkv parameters. Default: True for backward compatibility.
+        layernorm_tuning_enabled (bool, optional):
+            Whether to enable separate trainable layer norms for layers that share KV cache.
+            When enabled, consumer layers will have separate input_layernorm_swiftkv and
+            post_attention_layernorm_swiftkv parameters. Default: False.
         key_value_group_size (int, optional):
             DEPRECATED. No longer used. Kept for backward compatibility only.
     """
@@ -31,11 +39,15 @@ class Qwen3SwiftKVConfig(Qwen3Config):
         num_key_value_layers: Optional[int] = None,
         key_value_group_size: Optional[int] = None,
         kv_sharing_map: Optional[Dict[int, int]] = None,
+        mlp_tuning_enabled: bool = True,
+        layernorm_tuning_enabled: bool = False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.swiftkv = swiftkv
         self.kv_sharing_map = kv_sharing_map or {}
+        self.mlp_tuning_enabled = mlp_tuning_enabled
+        self.layernorm_tuning_enabled = layernorm_tuning_enabled
         
         if num_key_value_layers is None:
             if self.kv_sharing_map:

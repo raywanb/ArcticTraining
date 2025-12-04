@@ -36,6 +36,7 @@ KNOWN_HF_DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
     "nvidia/AceMath-Instruct-Training-Data": dict(
         split_mapping=dict(train="general_sft_stage2"), kwargs=dict(verification_mode="no_checks")
     ),
+    "cais/mmlu": dict(split_mapping=dict(train="auxiliary_train", eval="test")),
 }
 
 

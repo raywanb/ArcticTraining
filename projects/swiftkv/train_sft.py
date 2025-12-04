@@ -14,14 +14,11 @@
 # limitations under the License.
 
 import json
-import math
 from pathlib import Path
 from typing import Union
 
 import torch
-import torch.nn.functional as F
 import transformers
-from deepspeed.runtime.sequence_parallel.ulysses_sp import TiledFusedLogitsLoss
 from deepspeed.runtime.zero import GatheredParameters
 from packaging import version
 from torch.distributed import ReduceOp
@@ -39,6 +36,7 @@ from projects.swiftkv.models import Qwen2SwiftKVConfig
 from projects.swiftkv.models import Qwen3SwiftKVConfig
 from projects.swiftkv.models import register_all_swiftkv
 from projects.swiftkv.models.deepseek_v2 import register_deepseek_v2
+from projects.swiftkv.train import SwiftKVModelConfig, SwiftKVTrainerConfig
 
 register_all_swiftkv()
 
@@ -46,51 +44,8 @@ if version.parse(transformers.__version__) < version.parse("4.54.0"):
     register_deepseek_v2()  # Explicitly register because it's not in transformers
 
 
-class SwiftKVModelConfig(ModelConfig):
-    num_key_value_layers: int
-    """
-    Informational parameter indicating the number of layers that produce KV cache.
-    If not set and kv_sharing_map is provided, it will be computed automatically.
-    """
-    
-    kv_sharing_map: dict = {}
-    """
-    Primary mechanism for defining KV cache sharing. Maps consumer layer index to
-    producer layer index. If layer i maps to layer j, then layer i will use the
-    KV cache from layer j. This allows flexible sharing patterns.
-    """
-    
-    mlp_tuning_enabled: bool = True
-    """
-    Whether to enable separate trainable MLP projections for layers that share KV cache.
-    When enabled, consumer layers will have separate gate_proj_swiftkv, up_proj_swiftkv,
-    and down_proj_swiftkv parameters.
-    """
-    
-    layernorm_tuning_enabled: bool = True
-    """
-    Whether to enable separate trainable layer norms for layers that share KV cache.
-    When enabled, consumer layers will have separate input_layernorm_swiftkv and
-    post_attention_layernorm_swiftkv parameters.
-    """
-
-
-class SwiftKVTrainerConfig(TrainerConfig):
-    logits_loss_temp: float = 2.0
-    """Temperature for the distillation (KL-div) loss on logits."""
-
-    hidden_loss_mult: float = 1.0
-    """
-    Weight for the distillation (MSE) loss on hidden states. The final loss
-    is computed as `logits_loss + hidden_loss_mult * hidden_loss`.
-    """
-
-    hidden_loss_layer: int = -2
-    """The index of the layer whose output is used for the hidden loss."""
-
-
-class SwiftKVModelFactory(HFModelFactory):
-    name = "swiftkv"
+class SwiftKVSFTModelFactory(HFModelFactory):
+    name = "swiftkv_sft"
     config: SwiftKVModelConfig
 
     def post_create_config_callback(self, hf_config):
@@ -215,8 +170,17 @@ class SwiftKVModelFactory(HFModelFactory):
                             for teacher_param, student_param in zip(teacher_params, student_params):
                                 student_param.data.copy_(teacher_param.data)
                                 student_param.requires_grad = True
-            
-            
+        
+        # Check if we have any trainable parameters, if not set all parameters trainable
+        trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
+        if trainable_count == 0:
+            print("WARNING: No trainable parameters found. Setting all parameters to trainable.")
+            for param in model.parameters():
+                param.requires_grad = True
+            trainable_count = sum(1 for p in model.parameters() if p.requires_grad)
+            print(f"Set {trainable_count} parameters to trainable")
+        else:
+            print(f"Found {trainable_count} trainable parameters")
 
         # Initialize all kv parameters to the mean of the teacher layers in each kv group.
         # for idx, layer in enumerate(model.model.layers[model.config.num_key_value_layers :]):
@@ -257,118 +221,31 @@ class SwiftKVModelFactory(HFModelFactory):
         return model
 
 
-class SwiftKVTrainer(SFTTrainer):
-    name = "swiftkv"
+class SwiftKVSFTTrainer(SFTTrainer):
+    name = "swiftkv_sft"
     config: SwiftKVTrainerConfig
-    model_factory: SwiftKVModelFactory
+    model_factory: SwiftKVSFTModelFactory
     checkpoint_engine: Union[DSCheckpointEngine, HFCheckpointEngine]
 
     def forward(self, batch):
         batch = to_device(batch, self.device)
         
-        # Check trainable parameters
-        # trainable_count = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
-        # print(f"Total trainable parameters: {trainable_count}")
-        
-        with torch.no_grad():
-            self.model.swiftkv(False)
-            # print(f"Teacher mode - config.swiftkv: {self.model.swiftkv}")
-            self.model.eval()
-            teacher_outputs = self.model.model(**batch, output_hidden_states=True)
-        
+        # Run model in SwiftKV mode
         self.model.swiftkv(True)
-        # print(f"Student mode - config.swiftkv: {self.model.swiftkv}")
         self.model.train()
-        student_outputs = self.model.model(**batch, output_hidden_states=True)
+        outputs = self.model(**batch)
         
-        # # CRITICAL: Check if student outputs require grad
-        # print(f"Student hidden[-1] requires_grad: {student_outputs.hidden_states[-1].requires_grad}")
-        # print(f"Student hidden[-1] grad_fn: {student_outputs.hidden_states[-1].grad_fn}")
-        # print(f"Teacher hidden[-1] requires_grad: {teacher_outputs.hidden_states[-1].requires_grad}")
-        
-        return student_outputs, teacher_outputs
-    def compute_logits_loss(self, student_hidden, teacher_hidden, mask):
-
-        def _loss_fn(self, student_hidden, teacher_hidden, mask):
-            # Compute logits from hidden states (only for this shard when tiled)
-            student_logits = self.model.lm_head(student_hidden)
-            teacher_logits = self.model.lm_head(teacher_hidden)
-
-            # Soften the student logits by applying softmax first and log() second
-            soft_targets = F.softmax(teacher_logits / self.config.logits_loss_temp, dim=-1)
-            soft_prob = F.log_softmax(student_logits / self.config.logits_loss_temp, dim=-1)
-
-            # Calculate the soft logits loss. Scaled by T**2 as suggested by the
-            # authors of the paper "Distilling the knowledge in a neural network"
-            logits_loss = torch.sum(soft_targets * (soft_targets.log() - soft_prob), dim=-1)
-            logits_loss = torch.mean(logits_loss * self.config.logits_loss_temp**2)
-
-            return logits_loss
-
-        # Use tiled computation for memory efficiency
-        num_shards = self.get_num_shards(*student_hidden.shape[:2])
-        return TiledFusedLogitsLoss.apply(
-            _loss_fn,
-            self,
-            student_hidden,
-            teacher_hidden,
-            mask,
-            num_shards,
-            self.model.lm_head.parameters(),
-            "mean",
-        )
-
-    def compute_hidden_loss(self, student_hidden, teacher_hidden):
-
-        def _loss_fn(self, student_hidden, teacher_hidden):
-            return F.mse_loss(student_hidden, teacher_hidden)
-
-        # Use tiled computation for memory efficiency
-        num_shards = self.get_num_shards(*student_hidden.shape[:2])
-        return TiledFusedLogitsLoss.apply(
-            _loss_fn,
-            self,
-            student_hidden,
-            teacher_hidden,
-            None,
-            num_shards,
-            [],
-            "mean",
-        )
-
+        return outputs
+    
     def loss(self, batch) -> torch.Tensor:
-        import torch
-        student_outputs, teacher_outputs = self.forward(batch)
-
-        use_sequence_parallel = self.config.sequence_parallel_size > 1
-
-        # Compute logits loss for assistant turns
-        mask = batch["shift_labels" if use_sequence_parallel else "labels"] != -100
-        logits_loss = self.compute_logits_loss(
-            student_outputs.hidden_states[-1], teacher_outputs.hidden_states[-1], mask
-        )
-
-        # Compute hidden loss for all tokens
-        hidden_loss = self.compute_hidden_loss(
-            student_outputs.hidden_states[self.config.hidden_loss_layer],
-            teacher_outputs.hidden_states[self.config.hidden_loss_layer],
-        )
-
-        # Combine losses
-        loss = logits_loss + self.config.hidden_loss_mult * hidden_loss
-
+        outputs = self.forward(batch)
+        
+        # Standard cross-entropy loss
+        loss = outputs.loss
+        
         # Apply sequence parallel reduction if needed
+        use_sequence_parallel = self.config.sequence_parallel_size > 1
         if use_sequence_parallel:
             loss = torch.distributed.nn.functional.all_reduce(loss, op=ReduceOp.AVG, group=self.sp_group)
-
+        
         return loss
-
-    def get_num_shards(self, batch_size, seqlen):
-        slice_size_in_gb = 1  # XXX: make configurable?
-        vocab_size = self.model_unwrapped.config.vocab_size
-        logits_numel = batch_size * seqlen * vocab_size
-        size_in_gb = logits_numel * 4 / 2**30  # fp32
-        # the sp shard's seqlen sp shard can be easily not divisible by the derived number
-        # of chunked loss shards, so we use the uppper ceiling and allow the last chunk to
-        # be shorter than the rest
-        return math.ceil(size_in_gb / slice_size_in_gb)

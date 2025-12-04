@@ -24,6 +24,7 @@ from transformers.cache_utils import Cache
 from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
+from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.llama.modeling_llama import LlamaAttention
@@ -48,68 +49,75 @@ class LlamaSwiftKVAttention(LlamaAttention):
     def __init__(self, config: LlamaSwiftKVConfig, layer_idx: int):
         super().__init__(config, layer_idx=layer_idx)
 
-        swiftkv_layer_idx = layer_idx - config.num_key_value_layers
-        if layer_idx >= config.num_key_value_layers:
+        self.layer_idx = layer_idx
+        self.kv_sharing_target_layer_idx = config.kv_sharing_map.get(layer_idx, None)
+        print("layer_idx", layer_idx)
+        print("kv_sharing_target_layer_idx", self.kv_sharing_target_layer_idx)
+        # Create SwiftKV projections for layers that consume KV from other layers
+        if layer_idx in config.kv_sharing_map:
             self.q_proj_swiftkv = nn.Linear(
                 config.hidden_size,
                 config.num_attention_heads * self.head_dim,
                 bias=config.attention_bias,
             )
-            if swiftkv_layer_idx % config.key_value_group_size == 0:
-                self.k_proj_swiftkv = nn.Linear(
-                    config.hidden_size,
-                    config.num_key_value_heads * self.head_dim,
-                    bias=config.attention_bias,
-                )
-                self.v_proj_swiftkv = nn.Linear(
-                    config.hidden_size,
-                    config.num_key_value_heads * self.head_dim,
-                    bias=config.attention_bias,
-                )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        swiftkv_key_states: Optional[torch.Tensor] = None,
-        swiftkv_value_states: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        if swiftkv_key_states is not None or swiftkv_value_states is not None:
-            assert swiftkv_key_states is not None and swiftkv_value_states is not None
-            query_states = self.q_proj_swiftkv(hidden_states)
-            key_states = swiftkv_key_states
-            value_states = swiftkv_value_states
+        # Compute queries (always layer-specific)
+        if self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            query_states = self.q_proj_swiftkv(hidden_states).view(hidden_shape)
         else:
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            query_states = self.q_proj(hidden_states).view(hidden_shape)
 
-        query_states = query_states.view(hidden_shape).transpose(1, 2)
-        key_states = key_states.view(hidden_shape).transpose(1, 2)
-        value_states = value_states.view(hidden_shape).transpose(1, 2)
+        # print("SHARE KV", self.config.swiftkv, self.kv_sharing_target_layer_idx, past_key_value)
+        shares_kv = (self.config.swiftkv and 
+                     self.kv_sharing_target_layer_idx is not None and 
+                     past_key_value is not None)
 
+        if shares_kv:
+            target_idx = self.kv_sharing_target_layer_idx
+            
+            key_states = past_key_value.layers[target_idx].keys
+            value_states = past_key_value.layers[target_idx].values
+    
+        else:
+            key_states = self.k_proj(hidden_states).view(hidden_shape)
+            value_states = self.v_proj(hidden_states).view(hidden_shape)
+
+        # Reshape for attention
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2) if not shares_kv else key_states
+        value_states = value_states.transpose(1, 2) if not shares_kv else value_states
+
+        # Apply rotary embeddings
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
-        if past_key_value is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        # Update cache only for layers that compute their own KV
+        if past_key_value is not None and not shares_kv:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
 
+        # Attention computation
         attention_interface: Callable = eager_attention_forward
         if self.config._attn_implementation != "eager":
             if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
                 logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`."
-                    " Falling back to eager attention. This warning can be removed using the argument"
-                    ' `attn_implementation="eager"` when loading the model.'
+                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
                 )
             else:
                 attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
@@ -124,46 +132,79 @@ class LlamaSwiftKVAttention(LlamaAttention):
             scaling=self.scaling,
             **kwargs,
         )
-
+        
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
 
-class LlamaSwiftKVDecoderLayer(nn.Module):
+class LlamaSwiftKVMLP(LlamaMLP):
+    """MLP layer with SwiftKV support for KV distillation"""
+    
+    def __init__(self, config: LlamaSwiftKVConfig, layer_idx: int):
+        super().__init__(config)
+        self.config = config
+        self.layer_idx = layer_idx
+        
+        # Create SwiftKV-specific projections for layers that share KV
+        if config.mlp_tuning_enabled and layer_idx in config.kv_sharing_map:
+            self.gate_proj_swiftkv = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj_swiftkv = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            self.down_proj_swiftkv = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Use SwiftKV projections for layers that share KV cache when MLP tuning is enabled
+        if self.config.mlp_tuning_enabled and self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            down_proj = self.down_proj_swiftkv(
+                self.act_fn(self.gate_proj_swiftkv(x)) * self.up_proj_swiftkv(x)
+            )
+        else:
+            # Use original MLP projections
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
+
+class LlamaSwiftKVDecoderLayer(GradientCheckpointingLayer):
 
     def __init__(self, config: LlamaSwiftKVConfig, layer_idx: int):
         super().__init__()
+        self.config = config
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
         self.self_attn = LlamaSwiftKVAttention(config=config, layer_idx=layer_idx)
-        self.mlp = LlamaMLP(config)
+        self.mlp = LlamaSwiftKVMLP(config, layer_idx=layer_idx)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Create SwiftKV-specific layer norms for consumer layers
+        if config.layernorm_tuning_enabled and layer_idx in config.kv_sharing_map:
+            self.input_layernorm_swiftkv = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm_swiftkv = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        swiftkv_key_states: Optional[torch.Tensor] = None,
-        swiftkv_value_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = False,
         cache_position: Optional[torch.LongTensor] = None,
-        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        # Use SwiftKV layer norm for consumer layers when enabled
+        if self.config.layernorm_tuning_enabled and self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            hidden_states = self.input_layernorm_swiftkv(hidden_states)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
-            swiftkv_key_states=swiftkv_key_states,
-            swiftkv_value_states=swiftkv_value_states,
             position_ids=position_ids,
             past_key_value=past_key_value,
             output_attentions=output_attentions,
@@ -176,7 +217,11 @@ class LlamaSwiftKVDecoderLayer(nn.Module):
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Use SwiftKV layer norm for consumer layers when enabled
+        if self.config.layernorm_tuning_enabled and self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            hidden_states = self.post_attention_layernorm_swiftkv(hidden_states)
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -208,7 +253,6 @@ class LlamaSwiftKVModel(LlamaModel):
             [LlamaSwiftKVDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.norm_swiftkv = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
 
@@ -217,7 +261,7 @@ class LlamaSwiftKVModel(LlamaModel):
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
+        input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -225,17 +269,14 @@ class LlamaSwiftKVModel(LlamaModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+    ) -> BaseModelOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -244,6 +285,9 @@ class LlamaSwiftKVModel(LlamaModel):
                 "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`."
             )
             use_cache = False
+
+        if not isinstance(past_key_values, (type(None), Cache)):
+            raise ValueError("The `past_key_values` should be either a `Cache` object or `None`.")
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
@@ -278,58 +322,25 @@ class LlamaSwiftKVModel(LlamaModel):
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
-
-        swiftkv_key_states = {}
-        swiftkv_value_states = {}
-        num_key_value_layers = self.config.num_key_value_layers or self.config.num_hidden_layers
+        
         for layer_idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-
-            if self.config.swiftkv and layer_idx == num_key_value_layers:
-                swiftkv_hidden_states = self.norm_swiftkv(hidden_states)
-                if self.gradient_checkpointing and self.training:
-                    swiftkv_hidden_states.requires_grad_(True)
-                for i, layer in enumerate(self.layers[num_key_value_layers:]):
-                    swiftkv_key_states[layer_idx + i] = (
-                        layer.self_attn.k_proj_swiftkv(swiftkv_hidden_states)
-                        if i % self.config.key_value_group_size == 0
-                        else swiftkv_key_states[layer_idx + i - 1]
-                    )
-                    swiftkv_value_states[layer_idx + i] = (
-                        layer.self_attn.v_proj_swiftkv(swiftkv_hidden_states)
-                        if i % self.config.key_value_group_size == 0
-                        else swiftkv_value_states[layer_idx + i - 1]
-                    )
-
-            if self.gradient_checkpointing and self.training and layer_idx >= num_key_value_layers:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    swiftkv_key_states.get(layer_idx, None),
-                    swiftkv_value_states.get(layer_idx, None),
-                    causal_mask,
-                    position_ids,
-                    past_key_values,
-                    output_attentions,
-                    use_cache,
-                    cache_position,
-                    position_embeddings,
-                )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    swiftkv_key_states.get(layer_idx, None),
-                    swiftkv_value_states.get(layer_idx, None),
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    output_attentions=output_attentions,
-                    use_cache=use_cache,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **flash_attn_kwargs,
-                )
+            
+            if self.training and getattr(decoder_layer, "gradient_checkpointing", False):
+                hidden_states.requires_grad_(True)  # make the checkpointed input valid
+           
+            layer_outputs = decoder_layer(
+                hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+                **flash_attn_kwargs,
+            )
 
             hidden_states = layer_outputs[0]
 
@@ -342,13 +353,12 @@ class LlamaSwiftKVModel(LlamaModel):
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
 
-        output = BaseModelOutputWithPast(
+        return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
         )
-        return output if return_dict else output.to_tuple()
 
 
 class LlamaSwiftKVForCausalLM(LlamaForCausalLM):

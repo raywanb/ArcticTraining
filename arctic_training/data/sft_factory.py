@@ -261,6 +261,13 @@ class SFTDataConfig(DataConfig):
     repeat_to_pack_max_length: bool = False
     """ Whether to repeat the dataset samples to get closer to `max_length` for a packed sample. """
 
+    apply_chat_template: bool = True
+    """
+    Whether to apply the chat template when tokenizing messages. Set to False if your data
+    already has chat formatting tokens (e.g., <im_start>) and you want to tokenize directly.
+    When False, messages will be concatenated without applying the tokenizer's chat template.
+    """
+
     @model_validator(mode="after")
     def validate_padding(self) -> Self:
         if self.pad_to == "max_length" and "div_length" in self.model_fields_set:
@@ -375,6 +382,7 @@ class SFTDataFactory(DataFactory):
                     ex["messages"],
                     self.tokenizer,
                     mask_inputs=self.config.mask_inputs,
+                    apply_chat_template=self.config.apply_chat_template,
                 )
             },
             remove_columns=dataset.column_names,
@@ -388,8 +396,25 @@ class SFTDataFactory(DataFactory):
         messages: List[Dict[str, str]],
         tokenizer: PreTrainedTokenizerBase,
         mask_inputs: bool = True,
+        apply_chat_template: bool = True,
     ) -> BatchEncoding:
-        conversation_text = tokenizer.apply_chat_template(conversation=messages, tokenize=False)
+        if apply_chat_template:
+            conversation_text = tokenizer.apply_chat_template(conversation=messages, tokenize=False, add_generation_prompt=False)
+        else:
+            # If chat template is disabled, concatenate messages directly
+            # This assumes the data already has proper formatting tokens (e.g., <im_start>)
+            # If the content already contains formatted text, use it as-is
+            if isinstance(messages, str):
+                # Case A: Input is already a pre-formatted string
+                conversation_text = messages
+                # We cannot mask inputs for raw strings because we lose the role structure
+                if mask_inputs:
+                    mask_inputs = False 
+            else:
+                # Case B: Input is a list, but user wants raw concatenation (no Jinja template)
+                # We join content exactly as is. Users are responsible for their own separators/newlines.
+                conversation_text = "".join(m.get("content", "") for m in messages)
+        
         conversation_ids = tokenizer(
             conversation_text,
             return_offsets_mapping=mask_inputs,

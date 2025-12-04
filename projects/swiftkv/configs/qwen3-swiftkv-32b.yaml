@@ -6,9 +6,25 @@ gradient_accumulation_steps: 1
 logits_loss_temp: 2.0
 hidden_loss_layer: -2
 model:
-  name_or_path: meta-llama/Llama-3.1-8B-Instruct
-  num_key_value_layers: 28
-  kv_sharing_map: {16: 15, 17: 15, 18: 15, 19: 15}
+  name_or_path: Qwen/Qwen3-32B
+  num_key_value_layers: 48
+  kv_sharing_map:
+    4: 3
+    8: 7
+    12: 11
+    16: 15
+    20: 19
+    24: 23
+    28: 27
+    32: 31
+    36: 35
+    40: 39
+    44: 43
+    48: 47
+    52: 51
+    56: 55
+    60: 59
+    63: 62
   mlp_tuning_enabled: true
   layernorm_tuning_enabled: true
   attn_implementation: flash_attention_2
@@ -19,25 +35,27 @@ data:
   sources:
     - type: huggingface_instruct
       name_or_path: Open-Orca/OpenOrca
+      sample_count: 300000
+    - type: huggingface_instruct
+      name_or_path: nvidia/AceMath-Instruct-Training-Data
+      split: general_sft_stage2
       sample_count: 100000
-    # - type: huggingface_instruct
-    #   name_or_path: nvidia/AceMath-Instruct-Training-Data
-    #   split: general_sft_stage2
-    #   sample_count: 100000
-      # kwargs:
-      #   verification_mode: no_checks
+      kwargs:
+        verification_mode: no_checks
     # - type: huggingface_instruct
     #   name_or_path: lmsys/lmsys-chat-1m
     #   sample_count: 500000
     - type: huggingface_instruct
       name_or_path: openai/gsm8k
-      sample_count: 100000
+      sample_count: 100000 
       split: train
       kwargs:
         name: main
+
   cache_dir: ./data-fast/data-cache
   num_proc: 16
   max_length: 8192
+  apply_chat_template: false
 logger:
   level: INFO
   output_dir: "./"
@@ -51,5 +69,10 @@ optimizer:
 checkpoint:
   - type: huggingface
     save_every_n_epochs: 1
-    output_dir: /data/raywanb/checkpoint/llama-3.1-swiftkv-8b-instruct-4-consumers-middle-layer-sharing
+    output_dir: ./checkpoint/qwen3-swiftkv-32b-CLA4
     save_end_of_training: true
+wandb:
+  enable: false
+  entity: "raywan-university-of-california-berkeley"
+  project: "arctic-training"
+  name: "Qwen3 32B CLA4"  

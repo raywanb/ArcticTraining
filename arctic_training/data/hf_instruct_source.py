@@ -50,6 +50,8 @@ KNOWN_HF_INSTRUCT_DATASETS: Dict[str, Dict[str, Any]] = {
         role_mapping=dict(user="conversation.role.user", assistant="conversation.role.assistant")
     ),
     "TinyGSM/TinyGSM": dict(role_mapping=dict(user="question", assistant="code")),
+    "openai/gsm8k": dict(role_mapping=dict(user="question", assistant="answer"), kwargs=dict(name="main")),
+    "cais/mmlu": dict(role_mapping=dict(system="question", user="choices", assistant="answer"), kwargs=dict(name="all")),
 }
 
 
@@ -92,6 +94,10 @@ class HFDataSourceConfigInstruct(HFDataSourceConfig):
             if "content_key" not in self.model_fields_set and "content_key" in dataset_config:
                 content_key = dataset_config["content_key"]
                 self.content_key = content_key
+            if "kwargs" in dataset_config:
+                for key, value in dataset_config["kwargs"].items():
+                    if key not in self.kwargs:
+                        self.kwargs[key] = value
         return self
 
 

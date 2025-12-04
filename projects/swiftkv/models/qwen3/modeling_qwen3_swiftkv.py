@@ -20,6 +20,7 @@ from typing import Union
 
 import torch
 from torch import nn
+from transformers.activations import ACT2FN
 from transformers.cache_utils import Cache
 from transformers.cache_utils import DynamicCache
 from transformers.masking_utils import create_causal_mask
@@ -50,10 +51,9 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
 
         self.layer_idx = layer_idx
         self.kv_sharing_target_layer_idx = config.kv_sharing_map.get(layer_idx, None)
-        print("layer_idx", layer_idx)
-        print("kv_sharing_target_layer_idx", self.kv_sharing_target_layer_idx)
+        # print("layer_idx", layer_idx)
+        # print("kv_sharing_target_layer_idx", self.kv_sharing_target_layer_idx)
         # Create SwiftKV projections for layers that consume KV from other layers
-        # Only create these parameters if we have a kv_sharing_map (i.e., SwiftKV mode)
         if layer_idx in config.kv_sharing_map:
             self.q_proj_swiftkv = nn.Linear(
                 config.hidden_size,
@@ -87,18 +87,17 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         # Compute queries (always layer-specific)
-        # Use SwiftKV params only if swiftkv mode is active and this layer has SwiftKV params
         if self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
             query_states = self.q_norm_swiftkv(
                 self.q_proj_swiftkv(hidden_states).view(hidden_shape))
         else:
             query_states = self.q_norm(self.q_proj(hidden_states).view(hidden_shape))
 
-        # print("SHARE KV", self.config.swiftkv, self.kv_sharing_target_layer_idx, past_key_value)
         shares_kv = (self.config.swiftkv and 
                      self.kv_sharing_target_layer_idx is not None and 
                      past_key_value is not None)
 
+        # Check if target layer cache actually exists and has keys
         if shares_kv:
             target_idx = self.kv_sharing_target_layer_idx
             
@@ -158,15 +157,47 @@ class Qwen3SwiftKVAttention(Qwen3Attention):
         attn_output = self.o_proj(attn_output)
         return attn_output, attn_weights
 
+class Qwen3SwiftKVMLP(Qwen3MLP):
+    """MLP layer with SwiftKV support for KV distillation"""
+    
+    def __init__(self, config: Qwen3SwiftKVConfig, layer_idx: int):
+        super().__init__(config)
+        self.config = config
+        self.layer_idx = layer_idx
+        
+        # Create SwiftKV-specific projections for layers that share KV
+        if config.mlp_tuning_enabled and layer_idx in config.kv_sharing_map:
+            self.gate_proj_swiftkv = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            self.up_proj_swiftkv = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+            self.down_proj_swiftkv = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Use SwiftKV projections for layers that share KV cache when MLP tuning is enabled
+        if self.config.mlp_tuning_enabled and self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            down_proj = self.down_proj_swiftkv(
+                self.act_fn(self.gate_proj_swiftkv(x)) * self.up_proj_swiftkv(x)
+            )
+        else:
+            # Use original MLP projections
+            down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
+
 class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
 
     def __init__(self, config: Qwen3SwiftKVConfig, layer_idx: int):
         super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3SwiftKVAttention(config=config, layer_idx=layer_idx)
-        self.mlp = Qwen3MLP(config)
+        self.mlp = Qwen3SwiftKVMLP(config, layer_idx=layer_idx)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        
+        # Create SwiftKV-specific layer norms for consumer layers
+        if config.layernorm_tuning_enabled and layer_idx in config.kv_sharing_map:
+            self.input_layernorm_swiftkv = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.post_attention_layernorm_swiftkv = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         if (
             config.sliding_window and config._attn_implementation != "flash_attention_2"
         ):
@@ -189,7 +220,11 @@ class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        # Use SwiftKV layer norm for consumer layers when enabled
+        if self.config.layernorm_tuning_enabled and self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            hidden_states = self.input_layernorm_swiftkv(hidden_states)
+        else:
+            hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
@@ -207,7 +242,11 @@ class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
 
         # Fully Connected
         residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        # Use SwiftKV layer norm for consumer layers when enabled
+        if self.config.layernorm_tuning_enabled and self.config.swiftkv and self.layer_idx in self.config.kv_sharing_map:
+            hidden_states = self.post_attention_layernorm_swiftkv(hidden_states)
+        else:
+            hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -216,7 +255,6 @@ class Qwen3SwiftKVDecoderLayer(GradientCheckpointingLayer):
             outputs += (self_attn_weights,)
 
         return outputs
-
 class Qwen3SwiftKVModel(Qwen3Model):
     """
     Transformer decoder consisting of *config.num_hidden_layers* layers.

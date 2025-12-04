@@ -78,16 +78,19 @@ class DataSource(ABC, CallbackMixin, metaclass=RegistryMeta):
 
         if sample_count is not None:
             if len(dataset) < sample_count:
-                logger.warning(
+                logger.info(
                     f"Requested sample count {sample_count} is larger than the dataset size {len(dataset)}. "
-                    f"Using the full dataset {self.name} instead."
+                    f"Sampling with replacement (allowing duplicates) from {self.name}."
                 )
-                sample_count = len(dataset)
+                # Sample with replacement when sample_count > dataset size
+                rng = random.Random(self.config.sample_seed)
+                indices = rng.choices(range(len(dataset)), k=sample_count)
+                dataset = dataset.select(indices)
             else:
                 logger.info(f"Sampling {sample_count} examples from {self.name}")
-            rng = random.Random(self.config.sample_seed)
-            indices = rng.sample(range(len(dataset)), sample_count)
-            dataset = dataset.select(indices)
+                rng = random.Random(self.config.sample_seed)
+                indices = rng.sample(range(len(dataset)), sample_count)
+                dataset = dataset.select(indices)
 
         if len(dataset) < 1:
             raise ValueError(
